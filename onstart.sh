@@ -1,8 +1,7 @@
 #!/bin/bash
 # Vast.ai One-Click: SillyTavern + Ollama + ComfyUI + Wan2GP
-# Minimal reliable setup with health check summary.
+# Fixed: robust Node.js install (NodeSource fallback), better error handling
 #
-# Usage:
 # PROVISIONING_SCRIPT=https://raw.githubusercontent.com/gemmellbrett-ship-it/vastai-sillytavern-studio/main/onstart.sh
 
 set -euo pipefail
@@ -17,16 +16,36 @@ WORKSPACE="/workspace"
 cd "$WORKSPACE"
 export DEBIAN_FRONTEND=noninteractive
 
-# ---------- Base packages ----------
-echo "[0] Installing base packages..."
-apt-get update -qq
+# ---------- Robust Node.js + base packages ----------
+echo "[0] Installing base packages + Node.js..."
+apt-get update -qq || true
+apt-get install -y --fix-broken || true
+
+# Try distro nodejs/npm first
+if ! command -v npm &>/dev/null; then
+  apt-get install -y nodejs npm || true
+fi
+
+# Fallback to NodeSource 20 if still missing
+if ! command -v npm &>/dev/null; then
+  echo "npm missing — installing Node.js 20 from NodeSource..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || true
+  apt-get install -y nodejs || true
+fi
+
+# Other packages
 apt-get install -y -qq \
   git curl wget \
-  nodejs npm \
   python3-pip python3-venv \
   ffmpeg libgl1 \
   supervisor jq \
   chromium-browser || apt-get install -y -qq firefox || true
+
+if command -v npm &>/dev/null; then
+  echo "Node $(node -v) / npm $(npm -v) ready"
+else
+  echo "ERROR: npm still not available"
+fi
 
 # ---------- Supervisor ----------
 mkdir -p /etc/supervisor/conf.d
@@ -66,7 +85,12 @@ if [ ! -d "$WORKSPACE/SillyTavern" ]; then
 fi
 cd "$WORKSPACE/SillyTavern"
 git pull || true
-npm install --omit=dev || npm install
+
+if command -v npm &>/dev/null; then
+  npm install --omit=dev || npm install || echo "WARNING: npm install failed"
+else
+  echo "ERROR: npm not available — skipping npm install"
+fi
 
 mkdir -p data/default-user
 
