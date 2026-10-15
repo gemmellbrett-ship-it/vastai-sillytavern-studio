@@ -1,39 +1,43 @@
 #!/bin/bash
-# Vast.ai One-Click Template: SillyTavern (main) + Wan2GP + Ollama + ComfyUI + A1111 + Forge
-# Fully automated: installs, configures, starts all services, pre-connects SillyTavern for NSFW,
-# creates desktop shortcut. Idempotent. Logs to /workspace/setup.log
+# Vast.ai One-Click: SillyTavern + Ollama + ComfyUI + Wan2GP
+# Minimal reliable setup with health check summary.
 #
-# Usage in Vast.ai Linux Desktop template:
+# Usage:
 # PROVISIONING_SCRIPT=https://raw.githubusercontent.com/gemmellbrett-ship-it/vastai-sillytavern-studio/main/onstart.sh
 
 set -euo pipefail
 exec > >(tee -a /workspace/setup.log) 2>&1
 
 echo "=========================================="
-echo "Vast.ai SillyTavern NSFW Studio Setup"
+echo "Vast.ai SillyTavern Studio"
 echo "Started: $(date)"
 echo "=========================================="
 
 WORKSPACE="/workspace"
 cd "$WORKSPACE"
-
 export DEBIAN_FRONTEND=noninteractive
 
-# Basic tools + supervisor + browser
-echo "[0/8] Installing base packages..."
-apt-get update -qq || true
-apt-get install -y -qq git curl wget nodejs npm python3-pip python3-venv ffmpeg libgl1 supervisor jq chromium-browser || apt-get install -y -qq firefox || true
+# ---------- Base packages ----------
+echo "[0] Installing base packages..."
+apt-get update -qq
+apt-get install -y -qq \
+  git curl wget \
+  nodejs npm \
+  python3-pip python3-venv \
+  ffmpeg libgl1 \
+  supervisor jq \
+  chromium-browser || apt-get install -y -qq firefox || true
 
-# Start supervisord
-if ! pgrep -x supervisord > /dev/null; then
-  mkdir -p /etc/supervisor/conf.d
+# ---------- Supervisor ----------
+mkdir -p /etc/supervisor/conf.d
+if ! pgrep -x supervisord >/dev/null 2>&1; then
   supervisord -c /etc/supervisor/supervisord.conf || true
-  sleep 2
+  sleep 3
 fi
 
-# ========== 1. Ollama (uncensored LLMs) ==========
-echo "[1/8] Installing Ollama + uncensored models..."
-if ! command -v ollama &> /dev/null; then
+# ---------- 1. Ollama ----------
+echo "[1] Ollama + dolphin-mistral..."
+if ! command -v ollama &>/dev/null; then
   curl -fsSL https://ollama.com/install.sh | sh
 fi
 
@@ -51,13 +55,12 @@ EOF
 supervisorctl reread || true
 supervisorctl update || true
 supervisorctl start ollama || true
-sleep 10
+sleep 15
+ollama pull dolphin-mistral || echo "WARNING: dolphin-mistral pull failed"
+echo "Ollama started"
 
-ollama pull dolphin-mistral || echo "dolphin-mistral pull failed, continuing..."
-echo "Ollama ready on port 11434"
-
-# ========== 2. SillyTavern (main frontend) + auto-config ==========
-echo "[2/8] Installing SillyTavern and pre-configuring connections..."
+# ---------- 2. SillyTavern ----------
+echo "[2] SillyTavern..."
 if [ ! -d "$WORKSPACE/SillyTavern" ]; then
   git clone https://github.com/SillyTavern/SillyTavern.git
 fi
@@ -65,9 +68,8 @@ cd "$WORKSPACE/SillyTavern"
 git pull || true
 npm install --omit=dev || npm install
 
-mkdir -p data/default-user settings
+mkdir -p data/default-user
 
-# Pre-configure settings.json for Ollama + image backends (NSFW ready)
 cat > data/default-user/settings.json << 'EOF'
 {
   "main_api": "openai",
@@ -77,16 +79,7 @@ cat > data/default-user/settings.json << 'EOF'
   "openai_api_key": "ollama",
   "image_generation_source": "comfy",
   "comfy_url": "http://127.0.0.1:8188",
-  "sd_url": "http://127.0.0.1:7860",
-  "forge_url": "http://127.0.0.1:7862",
   "enable_extensions": true,
-  "extension_settings": {
-    "image_generation": {
-      "source": "comfy",
-      "comfy_url": "http://127.0.0.1:8188",
-      "sd_url": "http://127.0.0.1:7860"
-    }
-  },
   "nsfw_mode": true,
   "allow_nsfw": true
 }
@@ -116,16 +109,15 @@ EOF
 supervisorctl reread || true
 supervisorctl update || true
 supervisorctl start sillytavern || true
-echo "SillyTavern starting on port 8000 (pre-configured for Ollama + ComfyUI/A1111/Forge)"
-
+echo "SillyTavern started"
 cd "$WORKSPACE"
 
-# ========== 3. Wan2GP (video generation) ==========
-echo "[3/8] Installing Wan2GP..."
-if [ ! -d "$WORKSPACE/Wan2GP" ]; then
-  git clone https://github.com/deepbeepmeep/Wan2GP.git
+# ---------- 3. ComfyUI ----------
+echo "[3] ComfyUI..."
+if [ ! -d "$WORKSPACE/ComfyUI" ]; then
+  git clone https://github.com/comfyanonymous/ComfyUI.git
 fi
-cd "$WORKSPACE/Wan2GP"
+cd "$WORKSPACE/ComfyUI"
 git pull || true
 
 if [ ! -d "venv" ]; then
@@ -135,45 +127,11 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || \
   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 || true
-pip install -r requirements.txt || echo "Some Wan2GP deps failed; check logs"
-deactivate || true
-
-cat > /etc/supervisor/conf.d/wan2gp.conf << 'EOF'
-[program:wan2gp]
-command=/workspace/Wan2GP/venv/bin/python wgp.py --listen --server-port 7861 --server-name 0.0.0.0
-directory=/workspace/Wan2GP
-autostart=true
-autorestart=true
-stdout_logfile=/workspace/wan2gp.log
-stderr_logfile=/workspace/wan2gp.log
-user=root
-EOF
-
-supervisorctl reread || true
-supervisorctl update || true
-supervisorctl start wan2gp || true
-echo "Wan2GP starting on port 7861"
-
-cd "$WORKSPACE"
-
-# ========== 4. ComfyUI ==========
-echo "[4/8] Installing ComfyUI..."
-if [ ! -d "$WORKSPACE/ComfyUI" ]; then
-  git clone https://github.com/comfyanonymous/ComfyUI.git
-fi
-cd "$WORKSPACE/ComfyUI"
-git pull || true
-if [ ! -d "venv" ]; then
-  python3 -m venv venv
-fi
-source venv/bin/activate
-pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || true
-pip install -r requirements.txt || true
+pip install -r requirements.txt || echo "WARNING: some ComfyUI dependencies failed"
 if [ ! -d "custom_nodes/ComfyUI-Manager" ]; then
   git clone https://github.com/ltdrdata/ComfyUI-Manager.git custom_nodes/ComfyUI-Manager
 fi
-deactivate || true
+deactivate
 
 cat > /etc/supervisor/conf.d/comfyui.conf << 'EOF'
 [program:comfyui]
@@ -189,150 +147,101 @@ EOF
 supervisorctl reread || true
 supervisorctl update || true
 supervisorctl start comfyui || true
-echo "ComfyUI starting on port 8188 (CORS enabled)"
-
+echo "ComfyUI started"
+sleep 8
 cd "$WORKSPACE"
 
-# ========== 5. A1111 (Automatic1111) ==========
-echo "[5/8] Installing Automatic1111..."
-if [ ! -d "$WORKSPACE/stable-diffusion-webui" ]; then
-  git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git
+# ---------- 4. Wan2GP ----------
+echo "[4] Wan2GP..."
+if [ ! -d "$WORKSPACE/Wan2GP" ]; then
+  git clone https://github.com/deepbeepmeep/Wan2GP.git
 fi
-cd "$WORKSPACE/stable-diffusion-webui"
+cd "$WORKSPACE/Wan2GP"
 git pull || true
 
-echo 'export COMMANDLINE_ARGS="--api --listen --port 7860 --enable-insecure-extension-access --skip-version-check --cors-allow-origins=*"' > webui-user.sh
-chmod +x webui.sh webui-user.sh || true
+if [ ! -d "venv" ]; then
+  python3 -m venv venv
+fi
+source venv/bin/activate
+pip install --upgrade pip
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || \
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 || true
+pip install -r requirements.txt || echo "WARNING: some Wan2GP dependencies failed"
+deactivate
 
-cat > /etc/supervisor/conf.d/a1111.conf << 'EOF'
-[program:a1111]
-command=bash webui.sh
-directory=/workspace/stable-diffusion-webui
+cat > /etc/supervisor/conf.d/wan2gp.conf << 'EOF'
+[program:wan2gp]
+command=/workspace/Wan2GP/venv/bin/python wgp.py --listen --server-port 7861 --server-name 0.0.0.0
+directory=/workspace/Wan2GP
 autostart=true
 autorestart=true
-stdout_logfile=/workspace/a1111.log
-stderr_logfile=/workspace/a1111.log
+stdout_logfile=/workspace/wan2gp.log
+stderr_logfile=/workspace/wan2gp.log
 user=root
-environment=COMMANDLINE_ARGS="--api --listen --port 7860 --enable-insecure-extension-access --skip-version-check --cors-allow-origins=*"
 EOF
 
 supervisorctl reread || true
 supervisorctl update || true
-supervisorctl start a1111 || true
-echo "A1111 starting on port 7860"
-
+supervisorctl start wan2gp || true
+echo "Wan2GP started"
 cd "$WORKSPACE"
 
-# ========== 6. Forge ==========
-echo "[6/8] Installing SD Forge..."
-if [ ! -d "$WORKSPACE/stable-diffusion-webui-forge" ]; then
-  git clone https://github.com/lllyasviel/stable-diffusion-webui-forge.git
-fi
-cd "$WORKSPACE/stable-diffusion-webui-forge"
-git pull || true
-
-echo 'export COMMANDLINE_ARGS="--api --listen --port 7862 --enable-insecure-extension-access --skip-version-check --cors-allow-origins=*"' > webui-user.sh
-chmod +x webui.sh webui-user.sh || true
-
-cat > /etc/supervisor/conf.d/forge.conf << 'EOF'
-[program:forge]
-command=bash webui.sh
-directory=/workspace/stable-diffusion-webui-forge
-autostart=true
-autorestart=true
-stdout_logfile=/workspace/forge.log
-stderr_logfile=/workspace/forge.log
-user=root
-environment=COMMANDLINE_ARGS="--api --listen --port 7862 --enable-insecure-extension-access --skip-version-check --cors-allow-origins=*"
-EOF
-
-supervisorctl reread || true
-supervisorctl update || true
-supervisorctl start forge || true
-echo "Forge starting on port 7862"
-
-cd "$WORKSPACE"
-
-# ========== Shared models directory + symlinks ==========
-echo "[Models] Setting up shared models directory..."
-mkdir -p "$WORKSPACE/models/checkpoints" "$WORKSPACE/models/loras" "$WORKSPACE/models/vae" || true
-
-# Symlink shared models into each backend (idempotent)
+# ---------- Shared models ----------
+mkdir -p "$WORKSPACE/models/checkpoints" "$WORKSPACE/models/loras" "$WORKSPACE/models/vae"
 ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/ComfyUI/models/checkpoints" 2>/dev/null || true
-ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/stable-diffusion-webui/models/Stable-diffusion" 2>/dev/null || true
-ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/stable-diffusion-webui-forge/models/Stable-diffusion" 2>/dev/null || true
 
-echo "Shared models dir ready at /workspace/models/ (drop your NSFW checkpoints here)"
-
-# ========== 7. Readiness wait ==========
-echo "[7/8] Waiting for core services to become ready..."
-sleep 30
-
-for i in {1..18}; do
-  if curl -s --max-time 5 http://127.0.0.1:8000 > /dev/null 2>&1; then
-    echo "SillyTavern is responding on 8000"
-    break
-  fi
-  echo "Waiting for SillyTavern... ($i/18)"
-  sleep 10
-done
-
-if curl -s --max-time 5 http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
-  echo "Ollama API responding"
-fi
-
-# Jupyter fallback
-pip install jupyterlab notebook --quiet || true
-
-# ========== 8. Linux Desktop Shortcut for SillyTavern ==========
-echo "[8/8] Creating SillyTavern desktop shortcut..."
-
+# ---------- Desktop shortcut ----------
+echo "[5] Creating desktop shortcut..."
 mkdir -p /root/Desktop /home/*/Desktop 2>/dev/null || true
 
-DESKTOP_FILE="/root/Desktop/SillyTavern.desktop"
-cat > "$DESKTOP_FILE" << 'DESKTOP_EOF'
+cat > /root/Desktop/SillyTavern.desktop << 'EOF'
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=SillyTavern
-Comment=Open SillyTavern AI Chat (NSFW ready)
-Exec=sh -c "google-chrome --new-window http://127.0.0.1:8000 || chromium-browser --new-window http://127.0.0.1:8000 || firefox --new-window http://127.0.0.1:8000"
+Comment=Open SillyTavern (NSFW ready)
+Exec=sh -c "chromium-browser --new-window http://127.0.0.1:8000 || google-chrome --new-window http://127.0.0.1:8000 || firefox --new-window http://127.0.0.1:8000"
 Icon=web-browser
 Terminal=false
 StartupNotify=true
-Categories=Network;WebBrowser;
-DESKTOP_EOF
+Categories=Network;
+EOF
 
-chmod +x "$DESKTOP_FILE"
-cp "$DESKTOP_FILE" /home/*/Desktop/ 2>/dev/null || true
+chmod +x /root/Desktop/SillyTavern.desktop
+cp /root/Desktop/SillyTavern.desktop /home/*/Desktop/ 2>/dev/null || true
+touch /root/.config/panel-reload 2>/dev/null || true
 
-# Trigger desktop refresh for Selkies / XFCE / etc.
-mkdir -p /root/.config && touch /root/.config/panel-reload 2>/dev/null || true
-( pkill -HUP xfce4-panel 2>/dev/null || true )
-( pkill -HUP lxpanel 2>/dev/null || true )
+# ---------- Health check summary ----------
+echo ""
+echo "[6] Waiting for services..."
+sleep 30
 
-echo "SillyTavern shortcut created on desktop."
-
+echo ""
 echo "=========================================="
-echo "Setup complete: $(date)"
-echo ""
-echo "ALL SERVICES AUTO-STARTED VIA SUPERVISOR:"
-echo "  - SillyTavern:  http://127.0.0.1:8000  (pre-connected to Ollama + image backends)"
-echo "  - Ollama:       http://127.0.0.1:11434 (dolphin-mistral ready)"
-echo "  - Wan2GP:       http://127.0.0.1:7861  (video)"
-echo "  - ComfyUI:      http://127.0.0.1:8188  (image, CORS on)"
-echo "  - A1111:        http://127.0.0.1:7860  (image, --api)"
-echo "  - Forge:        http://127.0.0.1:7862  (image, --api)"
-echo ""
-echo "SillyTavern is pre-configured for:"
-echo "  - LLM: Ollama dolphin-mistral"
-echo "  - Image gen: ComfyUI (primary), A1111, Forge"
-echo ""
-echo "Desktop shortcut is on the desktop."
-echo "Control: supervisorctl status | start | stop | restart <name>"
-echo "Logs: /workspace/*.log and /workspace/setup.log"
-echo "Drop models into /workspace/models/checkpoints/ (symlinked into all backends)"
+echo "HEALTH CHECK SUMMARY"
 echo "=========================================="
 
-# Keep container alive
+check_port() {
+  local name="$1"
+  local port="$2"
+  if curl -sf --max-time 6 "http://127.0.0.1:${port}" >/dev/null 2>&1; then
+    echo "  [OK]   $name  (port $port)"
+  else
+    echo "  [FAIL] $name  (port $port)"
+  fi
+}
+
+check_port "SillyTavern" 8000
+check_port "Ollama"      11434
+check_port "ComfyUI"     8188
+check_port "Wan2GP"      7861
+
+echo ""
+echo "Models directory : /workspace/models/checkpoints/"
+echo "Logs             : /workspace/*.log and /workspace/setup.log"
+echo "Control          : supervisorctl status"
+echo "=========================================="
+echo "Setup finished: $(date)"
+echo "=========================================="
+
 sleep infinity
