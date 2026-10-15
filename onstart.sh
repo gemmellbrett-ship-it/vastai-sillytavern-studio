@@ -1,8 +1,10 @@
 #!/bin/bash
 # Vast.ai One-Click Template: SillyTavern (main) + Wan2GP + Ollama + ComfyUI + A1111 + Forge
-# Auto-setup: SillyTavern installed, pre-connected to Ollama (dolphin-mistral) and image backends
-# for NSFW/uncensored image + video generation. Ready before instance opens.
-# Supervisor manages all services. Idempotent. Logs to /workspace/setup.log
+# Fully automated: installs, configures, starts all services, pre-connects SillyTavern for NSFW,
+# creates desktop shortcut. Idempotent. Logs to /workspace/setup.log
+#
+# Usage in Vast.ai Linux Desktop template:
+# PROVISIONING_SCRIPT=https://raw.githubusercontent.com/gemmellbrett-ship-it/vastai-sillytavern-studio/main/onstart.sh
 
 set -euo pipefail
 exec > >(tee -a /workspace/setup.log) 2>&1
@@ -15,14 +17,18 @@ echo "=========================================="
 WORKSPACE="/workspace"
 cd "$WORKSPACE"
 
-# Basic tools + supervisor
+export DEBIAN_FRONTEND=noninteractive
+
+# Basic tools + supervisor + browser
+echo "[0/8] Installing base packages..."
 apt-get update -qq || true
-apt-get install -y -qq git curl wget nodejs npm python3-pip python3-venv ffmpeg libgl1 supervisor jq || true
+apt-get install -y -qq git curl wget nodejs npm python3-pip python3-venv ffmpeg libgl1 supervisor jq chromium-browser || apt-get install -y -qq firefox || true
 
 # Start supervisord
 if ! pgrep -x supervisord > /dev/null; then
   mkdir -p /etc/supervisor/conf.d
   supervisord -c /etc/supervisor/supervisord.conf || true
+  sleep 2
 fi
 
 # ========== 1. Ollama (uncensored LLMs) ==========
@@ -45,7 +51,7 @@ EOF
 supervisorctl reread || true
 supervisorctl update || true
 supervisorctl start ollama || true
-sleep 8
+sleep 10
 
 ollama pull dolphin-mistral || echo "dolphin-mistral pull failed, continuing..."
 echo "Ollama ready on port 11434"
@@ -59,11 +65,9 @@ cd "$WORKSPACE/SillyTavern"
 git pull || true
 npm install --omit=dev || npm install
 
-# Ensure data directories exist
 mkdir -p data/default-user settings
 
 # Pre-configure settings.json for Ollama + image backends (NSFW ready)
-# This sets default API to Ollama and enables image gen sources
 cat > data/default-user/settings.json << 'EOF'
 {
   "main_api": "openai",
@@ -88,7 +92,6 @@ cat > data/default-user/settings.json << 'EOF'
 }
 EOF
 
-# Basic config.yaml for listen + CORS
 cat > config.yaml << 'EOF'
 listen: true
 port: 8000
@@ -250,16 +253,27 @@ echo "Forge starting on port 7862"
 
 cd "$WORKSPACE"
 
-# ========== 7. Readiness wait (key for "100% working before instance opens") ==========
-echo "[7/8] Waiting for core services to become ready..."
-sleep 20
+# ========== Shared models directory + symlinks ==========
+echo "[Models] Setting up shared models directory..."
+mkdir -p "$WORKSPACE/models/checkpoints" "$WORKSPACE/models/loras" "$WORKSPACE/models/vae" || true
 
-# Quick health checks (non-fatal)
-for i in {1..12}; do
+# Symlink shared models into each backend (idempotent)
+ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/ComfyUI/models/checkpoints" 2>/dev/null || true
+ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/stable-diffusion-webui/models/Stable-diffusion" 2>/dev/null || true
+ln -sfn "$WORKSPACE/models/checkpoints" "$WORKSPACE/stable-diffusion-webui-forge/models/Stable-diffusion" 2>/dev/null || true
+
+echo "Shared models dir ready at /workspace/models/ (drop your NSFW checkpoints here)"
+
+# ========== 7. Readiness wait ==========
+echo "[7/8] Waiting for core services to become ready..."
+sleep 30
+
+for i in {1..18}; do
   if curl -s --max-time 5 http://127.0.0.1:8000 > /dev/null 2>&1; then
     echo "SillyTavern is responding on 8000"
     break
   fi
+  echo "Waiting for SillyTavern... ($i/18)"
   sleep 10
 done
 
@@ -267,40 +281,14 @@ if curl -s --max-time 5 http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
   echo "Ollama API responding"
 fi
 
-# ========== Shared models ==========
-mkdir -p "$WORKSPACE/models/checkpoints" "$WORKSPACE/models/loras" "$WORKSPACE/models/vae" || true
-echo "Shared models dir ready at /workspace/models/"
-
 # Jupyter fallback
 pip install jupyterlab notebook --quiet || true
-
-echo "=========================================="
-echo "Setup complete: $(date)"
-echo ""
-echo "ALL SERVICES AUTO-STARTED VIA SUPERVISOR:"
-echo "  - SillyTavern:  http://<instance>:8000  (pre-connected to Ollama + image backends)"
-echo "  - Ollama:       http://<instance>:11434 (dolphin-mistral ready)"
-echo "  - Wan2GP:       http://<instance>:7861  (video)"
-echo "  - ComfyUI:      http://<instance>:8188  (image, CORS on)"
-echo "  - A1111:        http://<instance>:7860  (image, --api)"
-echo "  - Forge:        http://<instance>:7862  (image, --api)"
-echo ""
-echo "SillyTavern is pre-configured:"
-echo "  - LLM: Ollama dolphin-mistral at http://127.0.0.1:11434"
-echo "  - Image gen: ComfyUI (primary), A1111, Forge"
-echo "  - Video: open Wan2GP on 7861 from browser or link from SillyTavern"
-echo ""
-echo "Control: supervisorctl status / start / stop / restart <name>"
-echo "Logs: /workspace/*.log and /workspace/setup.log"
-echo "=========================================="
 
 # ========== 8. Linux Desktop Shortcut for SillyTavern ==========
 echo "[8/8] Creating SillyTavern desktop shortcut..."
 
-# Ensure desktop directory exists (common locations)
 mkdir -p /root/Desktop /home/*/Desktop 2>/dev/null || true
 
-# Create .desktop file
 DESKTOP_FILE="/root/Desktop/SillyTavern.desktop"
 cat > "$DESKTOP_FILE" << 'DESKTOP_EOF'
 [Desktop Entry]
@@ -308,7 +296,7 @@ Version=1.0
 Type=Application
 Name=SillyTavern
 Comment=Open SillyTavern AI Chat (NSFW ready)
-Exec=google-chrome --new-window http://127.0.0.1:8000 || chromium-browser --new-window http://127.0.0.1:8000 || firefox --new-window http://127.0.0.1:8000
+Exec=sh -c "google-chrome --new-window http://127.0.0.1:8000 || chromium-browser --new-window http://127.0.0.1:8000 || firefox --new-window http://127.0.0.1:8000"
 Icon=web-browser
 Terminal=false
 StartupNotify=true
@@ -316,19 +304,35 @@ Categories=Network;WebBrowser;
 DESKTOP_EOF
 
 chmod +x "$DESKTOP_FILE"
-# Copy to other possible desktops
 cp "$DESKTOP_FILE" /home/*/Desktop/ 2>/dev/null || true
 
-# For Selkies Desktop reload (if applicable)
+# Trigger desktop refresh for Selkies / XFCE / etc.
 mkdir -p /root/.config && touch /root/.config/panel-reload 2>/dev/null || true
+( pkill -HUP xfce4-panel 2>/dev/null || true )
+( pkill -HUP lxpanel 2>/dev/null || true )
 
-echo "SillyTavern shortcut created on desktop. Double-click to open in browser."
+echo "SillyTavern shortcut created on desktop."
 
-# Optional: Ensure a browser is available
-if ! command -v google-chrome &> /dev/null && ! command -v chromium-browser &> /dev/null; then
-  apt-get install -y -qq chromium-browser || apt-get install -y -qq firefox || true
-fi
-
+echo "=========================================="
+echo "Setup complete: $(date)"
+echo ""
+echo "ALL SERVICES AUTO-STARTED VIA SUPERVISOR:"
+echo "  - SillyTavern:  http://127.0.0.1:8000  (pre-connected to Ollama + image backends)"
+echo "  - Ollama:       http://127.0.0.1:11434 (dolphin-mistral ready)"
+echo "  - Wan2GP:       http://127.0.0.1:7861  (video)"
+echo "  - ComfyUI:      http://127.0.0.1:8188  (image, CORS on)"
+echo "  - A1111:        http://127.0.0.1:7860  (image, --api)"
+echo "  - Forge:        http://127.0.0.1:7862  (image, --api)"
+echo ""
+echo "SillyTavern is pre-configured for:"
+echo "  - LLM: Ollama dolphin-mistral"
+echo "  - Image gen: ComfyUI (primary), A1111, Forge"
+echo ""
+echo "Desktop shortcut is on the desktop."
+echo "Control: supervisorctl status | start | stop | restart <name>"
+echo "Logs: /workspace/*.log and /workspace/setup.log"
+echo "Drop models into /workspace/models/checkpoints/ (symlinked into all backends)"
+echo "=========================================="
 
 # Keep container alive
 sleep infinity
